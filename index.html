@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copy-on-Write Memory Demonstrator</title>
+<style>
+  :root { --bg:#0b1b2e; --card:#13283f; --txt:#eef3f8; --mut:#8fa3b8; --priv:#0f9d8f; --shared:#f2a33a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Calibri, Arial, sans-serif; background:var(--bg); color:var(--txt); padding:24px; }
+  h1 { margin:0 0 4px; font-size:28px; }
+  p.sub { margin:0 0 18px; color:var(--mut); }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; align-items:center; }
+  button { background:#1f3a5a; color:var(--txt); border:0; border-radius:8px; padding:8px 14px; font-size:15px; cursor:pointer; }
+  button:hover { background:#2b4f7a; }
+  button.main { background:var(--priv); font-weight:bold; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border-radius:12px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:18px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:8px; background:#0f2236; }
+  .tag { font-size:12px; padding:2px 8px; border-radius:10px; background:var(--shared); color:#111; font-weight:bold; }
+  .frame { display:flex; justify-content:space-between; padding:10px 12px; margin-bottom:8px; border-radius:8px; color:#111; font-weight:bold; }
+  .frame.shared { background:var(--shared); } .frame.priv { background:var(--priv); color:#fff; }
+  .stats { display:flex; gap:12px; flex-wrap:wrap; margin:16px 0; }
+  .stat { background:var(--card); border-radius:10px; padding:10px 16px; }
+  .stat b { font-size:24px; display:block; }
+  #log { background:#0f2236; border-radius:10px; padding:12px; height:190px; overflow:auto; font-family: Consolas, monospace; font-size:13px; }
+  #log div { margin-bottom:4px; } .copy { color:var(--shared); } .ok { color:#6fe3c1; }
+  .legend span { display:inline-block; width:12px; height:12px; border-radius:3px; margin:0 6px 0 14px; vertical-align:middle; }
+  .small { padding:4px 10px; font-size:13px; }
+</style>
+</head>
+<body>
+  <h1>Copy-on-Write Memory Demonstrator</h1>
+  <p class="sub">fork() shares memory. A page is copied only when someone writes to it.</p>
+
+  <div class="bar">
+    <button class="main" id="forkBtn" onclick="doFork()">1. fork()</button>
+    <button onclick="resetAll()">Reset</button>
+    <span class="legend"><span style="background:var(--shared)"></span>shared frame (refcount &gt; 1)
+      <span style="background:var(--priv)"></span>private frame (refcount = 1)</span>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>Parent page table</h2><div id="p0"></div></div>
+    <div class="card"><h2>Physical frames</h2><div id="frames"></div></div>
+    <div class="card"><h2>Child page table</h2><div id="p1"></div><div id="nochild" style="color:var(--mut)">No child yet. Press fork().</div></div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b id="sFrames">0</b>frames in use</div>
+    <div class="stat"><b id="sNoCow">0</b>frames needed without COW</div>
+    <div class="stat"><b id="sFaults">0</b>write faults</div>
+    <div class="stat"><b id="sCopies">0</b>real page copies</div>
+  </div>
+
+  <div class="card"><h2>Event log</h2><div id="log"></div></div>
+
+<script>
+const N = 6;                       // pages per process
+let frames, procs, copies, faults, writeCount;
+
+function resetAll() {
+  frames = []; procs = [{ name: "Parent", pt: [] }];
+  for (let i = 0; i < N; i++) {
+    frames.push({ data: "D" + i, ref: 1 });
+    procs[0].pt.push({ f: i, cow: false });
+  }
+  copies = 0; faults = 0; writeCount = 0;
+  document.getElementById("log").innerHTML = "";
+  say("Parent created with " + N + " private pages (one frame each).");
+  render();
+}
+
+function say(msg, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = msg;
+  const log = document.getElementById("log");
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function doFork() {
+  if (procs.length > 1) return;
+  const child = { name: "Child", pt: [] };
+  procs[0].pt.forEach(e => {
+    e.cow = true;                         // both sides become copy-on-write
+    frames[e.f].ref++;                    // frame is now shared
+    child.pt.push({ f: e.f, cow: true });
+  });
+  procs.push(child);
+  say("fork(): page table copied, ZERO frames copied. Every frame refcount = 2.", "ok");
+  render();
+}
+
+function readPage(p, i) {
+  const e = procs[p].pt[i];
+  say(procs[p].name + " reads page " + i + " = " + frames[e.f].data + " (F" + e.f + "). No fault, no copy.");
+}
+
+function writePage(p, i) {
+  const proc = procs[p], e = proc.pt[i];
+  if (e.cow) {
+    faults++;
+    if (frames[e.f].ref > 1) {
+      const old = e.f;
+      frames.push({ data: frames[old].data, ref: 1 });   // copy the 4 KiB
+      frames[old].ref--;
+      e.f = frames.length - 1;
+      copies++;
+      say(proc.name + " writes page " + i + ": COW FAULT -> new frame F" + e.f + " copied from F" + old + ".", "copy");
+    } else {
+      say(proc.name + " writes page " + i + ": COW fault but refcount = 1, so no copy needed (just make it writable).", "copy");
+    }
+    e.cow = false;
+  } else {
+    say(proc.name + " writes page " + i + ": already private, no fault.");
+  }
+  frames[e.f].data = proc.name[0] + (++writeCount);
+  render();
+}
+
+function table(p) {
+  const proc = procs[p];
+  return proc.pt.map((e, i) =>
+    '<div class="row"><span>page ' + i + ' &rarr; <b>F' + e.f + '</b> = ' + frames[e.f].data + '</span>' +
+    (e.cow ? '<span class="tag">COW</span>' : '<span></span>') +
+    '<span><button class="small" onclick="readPage(' + p + ',' + i + ')">Read</button> ' +
+    '<button class="small" onclick="writePage(' + p + ',' + i + ')">Write</button></span></div>'
+  ).join("");
+}
+
+function render() {
+  document.getElementById("p0").innerHTML = table(0);
+  const has = procs.length > 1;
+  document.getElementById("p1").innerHTML = has ? table(1) : "";
+  document.getElementById("nochild").style.display = has ? "none" : "block";
+  document.getElementById("forkBtn").disabled = has;
+  document.getElementById("frames").innerHTML = frames.map((f, i) =>
+    '<div class="frame ' + (f.ref > 1 ? "shared" : "priv") + '"><span>F' + i + ' = ' + f.data +
+    '</span><span>refcount ' + f.ref + '</span></div>').join("");
+  document.getElementById("sFrames").textContent = frames.length;
+  document.getElementById("sNoCow").textContent = N * procs.length;
+  document.getElementById("sFaults").textContent = faults;
+  document.getElementById("sCopies").textContent = copies;
+}
+
+resetAll();
+</script>
+</body>
+</html>
